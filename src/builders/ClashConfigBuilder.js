@@ -1,7 +1,7 @@
 import yaml from 'js-yaml';
 import { CLASH_CONFIG, generateRules, generateClashRuleSets, getOutbounds, PREDEFINED_RULE_SETS, DIRECT_DEFAULT_RULES } from '../config/index.js';
 import { BaseConfigBuilder } from './BaseConfigBuilder.js';
-import { deepCopy, groupProxiesByCountry } from '../utils.js';
+import { deepCopy, groupProxiesByCountry, buildCountryNameFilter } from '../utils.js';
 import { addProxyWithDedup } from './helpers/proxyHelpers.js';
 import { buildSelectorMembers, buildNodeSelectMembers, buildCustomRuleMembers, uniqueNames } from './helpers/groupBuilder.js';
 import { emitClashRules, sanitizeClashProxyGroups } from './helpers/clashConfigUtils.js';
@@ -152,6 +152,7 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
                     alterId: proxy.alter_id ?? 0,
                     cipher: proxy.security,
                     tls: proxy.tls?.enabled || false,
+                    'client-fingerprint': proxy.tls?.utls?.fingerprint,
                     servername: proxy.tls?.server_name || '',
                     'skip-cert-verify': !!proxy.tls?.insecure,
                     network: proxy.transport?.type || proxy.network || 'tcp',
@@ -193,6 +194,7 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
                     server: proxy.server,
                     port: proxy.server_port,
                     uuid: proxy.uuid,
+                    ...(proxy.encryption ? { encryption: proxy.encryption } : {}),
                     cipher: proxy.security,
                     tls: proxy.tls?.enabled || false,
                     'client-fingerprint': proxy.tls?.utls?.fingerprint,
@@ -202,9 +204,15 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
                         path: proxy.transport.path,
                         headers: proxy.transport.headers
                     } : undefined,
+                    'xhttp-opts': proxy.transport?.type === 'xhttp' ? {
+                        path: proxy.transport.path,
+                        host: proxy.transport.headers?.host,
+                        mode: proxy.transport.mode
+                    } : undefined,
                     'reality-opts': proxy.tls?.reality?.enabled ? {
                         'public-key': proxy.tls.reality.public_key,
                         'short-id': proxy.tls.reality.short_id,
+                        'support-x25519mlkem768': proxy.tls.reality.support_x25519mlkem768,
                     } : undefined,
                     'grpc-opts': proxy.transport?.type === 'grpc' ? {
                         'grpc-service-name': proxy.transport.service_name,
@@ -255,6 +263,7 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
                     'reality-opts': proxy.tls?.reality?.enabled ? {
                         'public-key': proxy.tls.reality.public_key,
                         'short-id': proxy.tls.reality.short_id,
+                        'support-x25519mlkem768': proxy.tls.reality.support_x25519mlkem768,
                     } : undefined,
                     'grpc-opts': proxy.transport?.type === 'grpc' ? {
                         'grpc-service-name': proxy.transport.service_name,
@@ -283,7 +292,10 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
                     ...(proxy.reduce_rtt !== undefined ? { 'reduce-rtt': proxy.reduce_rtt } : {}),
                     ...(proxy.fast_open !== undefined ? { 'fast-open': proxy.fast_open } : {}),
                 };
-            case 'anytls':
+            case 'anytls': {
+                const idleSessionCheckInterval = proxy['idle-session-check-interval'] ?? proxy.idle_session_check_interval;
+                const idleSessionTimeout = proxy['idle-session-timeout'] ?? proxy.idle_session_timeout;
+                const minIdleSession = proxy['min-idle-session'] ?? proxy.min_idle_session;
                 return {
                     name: proxy.tag,
                     type: 'anytls',
@@ -295,10 +307,11 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
                     ...(proxy.tls?.server_name ? { sni: proxy.tls.server_name } : {}),
                     ...(proxy.tls?.insecure !== undefined ? { 'skip-cert-verify': !!proxy.tls.insecure } : {}),
                     ...(proxy.tls?.alpn ? { alpn: proxy.tls.alpn } : {}),
-                    ...(proxy['idle-session-check-interval'] !== undefined ? { 'idle-session-check-interval': proxy['idle-session-check-interval'] } : {}),
-                    ...(proxy['idle-session-timeout'] !== undefined ? { 'idle-session-timeout': proxy['idle-session-timeout'] } : {}),
-                    ...(proxy['min-idle-session'] !== undefined ? { 'min-idle-session': proxy['min-idle-session'] } : {}),
+                    ...(idleSessionCheckInterval !== undefined ? { 'idle-session-check-interval': idleSessionCheckInterval } : {}),
+                    ...(idleSessionTimeout !== undefined ? { 'idle-session-timeout': idleSessionTimeout } : {}),
+                    ...(minIdleSession !== undefined ? { 'min-idle-session': minIdleSession } : {}),
                 };
+            }
             default:
                 return proxy; // Return as-is if no specific conversion is defined
         }
@@ -471,6 +484,21 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
             getName: proxy => this.getProxyName(proxy)
         });
 
+        // Provider mode leaves no inline proxies, but mihomo can filter provider
+        // members per group (`use` + `filter`), so enumerate countries from the
+        // names collected at fetch time and reference the providers instead.
+        const providerNames = this.getAllProviderNames();
+        if (providerNames.length > 0 && this.providerNodeNames.length > 0) {
+            const providerCountryGroups = groupProxiesByCountry(this.providerNodeNames, {
+                getName: name => name
+            });
+            Object.keys(providerCountryGroups).forEach(country => {
+                if (!countryGroups[country]) {
+                    countryGroups[country] = { ...providerCountryGroups[country], proxies: [] };
+                }
+            });
+        }
+
         const existingNames = new Set((this.config['proxy-groups'] || []).map(g => normalizeGroupName(g?.name)).filter(Boolean));
 
         const manualProxyNames = proxies.map(p => p?.name).filter(Boolean);
@@ -497,7 +525,7 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
         const countryGroupNames = [];
 
         countries.forEach(country => {
-            const { emoji, name, proxies } = countryGroups[country];
+            const { emoji, name, aliases, proxies } = countryGroups[country];
             const groupName = `${emoji} ${name}`;
             const norm = normalizeGroupName(groupName);
             if (!existingNames.has(norm)) {
@@ -509,10 +537,14 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
                     interval: 300,
                     lazy: false
                 };
-                // Add 'use' field if we have proxy-providers
-                const providerNames = this.getAllProviderNames();
+                // Add 'use' field if we have proxy-providers, narrowed to this
+                // country so provider members don't leak into every group
                 if (providerNames.length > 0) {
                     group.use = providerNames;
+                    const filter = buildCountryNameFilter({ emoji, aliases });
+                    if (filter) {
+                        group.filter = filter;
+                    }
                 }
                 this.config['proxy-groups'].push(group);
                 existingNames.add(norm);
@@ -673,7 +705,7 @@ export class ClashConfigBuilder extends BaseConfigBuilder {
             const defaultController = '0.0.0.0:9090';
             const defaultUiPath = './ui';
             const defaultUiName = 'zashboard';
-            const defaultUiUrl = 'https://gh-proxy.com/https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages.zip';
+            const defaultUiUrl = 'https://gh-proxy.org/https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages.zip';
             const defaultSecret = '';
 
             const controller = this.externalController || this.config['external-controller'] || defaultController;
